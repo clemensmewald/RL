@@ -54,8 +54,8 @@ def _disable_opd_full(worker) -> None:
     """
     worker._opd_full_enabled = False
     worker._opd_full_lm_head_lifecycle = None
-    worker._opd_full_teacher_lm_head = None
-    worker._opd_full_teacher_checkpoint_path = None
+    worker._opd_full_teacher_lm_heads = {}
+    worker._opd_full_teacher_checkpoint_paths = {}
 
 
 def test_model_owned_packing_capability_is_detected():

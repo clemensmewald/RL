@@ -700,16 +700,19 @@ class MegatronPolicyWorkerImpl(
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
 
-        # Full-vocabulary MOPD: this rank's teacher LM-head shard, loaded on
-        # demand (see load_opd_full_teacher_lm_head). A plain tensor, not a
-        # module, so it stays invisible to checkpoint saving and refit.
+        # Full-vocabulary MOPD: this rank's teacher LM-head shard(s), loaded on
+        # demand (see load_opd_full_teacher_lm_head). Keyed by teacher_index
+        # (stable per unique checkpoint, assigned by create_teacher_worker_groups)
+        # so multi-teacher runs hold one shard per teacher; single-teacher runs
+        # just have one entry. Plain tensors, not modules, so they stay invisible
+        # to checkpoint saving and refit.
         opd_full_cfg = self.cfg.get("on_policy_distillation_full") or {}
         self._opd_full_enabled = bool(opd_full_cfg)
         self._opd_full_lm_head_lifecycle: Optional[str] = (
             opd_full_cfg["teacher_lm_head_lifecycle"] if opd_full_cfg else None
         )
-        self._opd_full_teacher_lm_head: Optional[torch.Tensor] = None
-        self._opd_full_teacher_checkpoint_path: Optional[str] = None
+        self._opd_full_teacher_lm_heads: dict[int, torch.Tensor] = {}
+        self._opd_full_teacher_checkpoint_paths: dict[int, str] = {}
 
         self._init_inference_engine_state()
         self._setup_colocated_cuda_graph_managers()
@@ -928,7 +931,7 @@ class MegatronPolicyWorkerImpl(
                     num_microbatches=num_microbatches,
                     sampling_params=self.sampling_params,
                     draft_model=self.draft_model,
-                    teacher_output_layer_weight=self._opd_full_teacher_lm_head,
+                    teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
                 )
 
                 rerun_state_machine = get_rerun_state_machine()
@@ -1583,7 +1586,7 @@ class MegatronPolicyWorkerImpl(
             num_microbatches=num_microbatches,
             sampling_params=self.sampling_params,
             draft_model=self.draft_model,
-            teacher_output_layer_weight=self._opd_full_teacher_lm_head,
+            teacher_output_layer_weight_by_index=self._opd_full_teacher_lm_heads,
         )
 
         # Placeholder N=1: loss returns un-normalized sums. ``backward``
@@ -2099,80 +2102,86 @@ class MegatronPolicyWorkerImpl(
             "on_policy_distillation.full.teacher_payload='logits'."
         )
 
-    def load_opd_full_teacher_lm_head(self, teacher_path_config: PolicyConfig) -> str:
-        """Resolve and load the teacher LM head for full-vocabulary MOPD.
+    def load_opd_full_teacher_lm_head(
+        self, teacher_path_config: PolicyConfig, teacher_index: int = 0
+    ) -> str:
+        """Resolve and load one teacher's LM head for full-vocabulary MOPD.
 
-        Called after the teacher worker groups exist, because the teacher's
-        Megatron checkpoint is only materialized by their HF conversion. Path
-        resolution happens here rather than on the driver: the driver process
-        is never provisioned with the mcore extra that validate_model_paths'
-        module needs.
+        Called once per unique teacher checkpoint after the teacher worker
+        groups exist, because each teacher's Megatron checkpoint is only
+        materialized by its own HF conversion. Path resolution happens here
+        rather than on the driver: the driver process is never provisioned
+        with the mcore extra that validate_model_paths' module needs.
 
         Args:
             teacher_path_config: The teacher group's own policy config, which
                 carries no `pretrained_checkpoint`, so resolution keys off the
                 teacher's model name.
+            teacher_index: Stable per-checkpoint index (see
+                ``create_teacher_worker_groups``) this shard is stored under.
 
         Returns:
             The resolved Megatron checkpoint root of the teacher.
         """
         _, teacher_pretrained_path, _ = validate_model_paths(teacher_path_config)
-        self._load_opd_full_teacher_lm_head_from_path(teacher_pretrained_path)
+        self._load_opd_full_teacher_lm_head_from_path(
+            teacher_pretrained_path, teacher_index
+        )
         return teacher_pretrained_path
 
     def _load_opd_full_teacher_lm_head_from_path(
-        self, teacher_pretrained_path: str
+        self, teacher_pretrained_path: str, teacher_index: int
     ) -> None:
-        """Load this rank's shard of the teacher LM head from an already-resolved path."""
+        """Load this rank's shard of one teacher's LM head from an already-resolved path."""
         owner = self._resolve_output_layer_owner()
         output_layer = owner.output_layer
         output_weight = output_layer.weight
         if output_weight is None:
             output_weight = owner.shared_embedding_or_output_weight()
 
-        self._opd_full_teacher_checkpoint_path = teacher_pretrained_path
+        self._opd_full_teacher_checkpoint_paths[teacher_index] = teacher_pretrained_path
         teacher_lm_head = load_teacher_output_layer_weight(
             teacher_pretrained_path=teacher_pretrained_path,
             local_vocab_size=output_layer.output_size_per_partition,
             dtype=output_weight.dtype,
         )
-        self._opd_full_teacher_lm_head = teacher_lm_head
+        self._opd_full_teacher_lm_heads[teacher_index] = teacher_lm_head
         if self._opd_full_lm_head_lifecycle == "none":
             self._move_opd_full_teacher_lm_head("cuda")
 
     @torch.no_grad()
     def _move_opd_full_teacher_lm_head(self, device: str) -> None:
-        """Move the cached teacher LM-head shard between CPU and GPU."""
-        if self._opd_full_teacher_lm_head is None:
+        """Move every cached teacher LM-head shard between CPU and GPU."""
+        if not self._opd_full_teacher_lm_heads:
             return
         target_device = torch.device(device)
-        if self._opd_full_teacher_lm_head.device == target_device:
-            return
-        self._opd_full_teacher_lm_head = self._opd_full_teacher_lm_head.to(
-            device=target_device, non_blocking=True
-        )
+        for teacher_index, lm_head in self._opd_full_teacher_lm_heads.items():
+            if lm_head.device == target_device:
+                continue
+            self._opd_full_teacher_lm_heads[teacher_index] = lm_head.to(
+                device=target_device, non_blocking=True
+            )
 
     def _release_opd_full_teacher_lm_head(self) -> None:
         """Apply the configured lifecycle policy after a training phase."""
-        if self._opd_full_teacher_lm_head is None:
+        if not self._opd_full_teacher_lm_heads:
             return
         if self._opd_full_lm_head_lifecycle == "offload":
             self._move_opd_full_teacher_lm_head("cpu")
         elif self._opd_full_lm_head_lifecycle == "evict":
-            self._opd_full_teacher_lm_head = None
+            self._opd_full_teacher_lm_heads = {}
 
     def _stage_opd_full_teacher_lm_head_for_training(self) -> None:
-        """Make the teacher LM-head shard resident on GPU for a train step."""
+        """Make every teacher LM-head shard resident on GPU for a train step."""
         if not self._opd_full_enabled:
             return
         if (
-            self._opd_full_teacher_lm_head is None
+            not self._opd_full_teacher_lm_heads
             and self._opd_full_lm_head_lifecycle == "evict"
-            and self._opd_full_teacher_checkpoint_path is not None
+            and self._opd_full_teacher_checkpoint_paths
         ):
-            self._load_opd_full_teacher_lm_head_from_path(
-                self._opd_full_teacher_checkpoint_path
-            )
+            for teacher_index, path in self._opd_full_teacher_checkpoint_paths.items():
+                self._load_opd_full_teacher_lm_head_from_path(path, teacher_index)
         self._move_opd_full_teacher_lm_head("cuda")
 
     @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs_with_full_payload")

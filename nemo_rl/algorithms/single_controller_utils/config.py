@@ -861,9 +861,9 @@ def _validate_opd_full_config(
     Raises:
         ValueError: If ``opd_full`` is enabled with an unsupported backend, an
             incompatible logprob path, a fused packing path that never reaches
-            the opd_full branch, more than one teacher checkpoint, a student
-            pipeline-parallel size the teacher LM-head load cannot support, or a
-            sampling temperature the hidden-state payload cannot honor.
+            the opd_full branch, a student pipeline-parallel size the teacher
+            LM-head load cannot support, or a sampling temperature the
+            hidden-state payload cannot honor.
     """
     full_cfg = opd_module.get_opd_full_config(master_config)
     if full_cfg is None:
@@ -901,16 +901,11 @@ def _validate_opd_full_config(
             "Set sequence_packing.fuse_loss=false."
         )
 
-    unique_teacher_checkpoints = sorted(
-        set(opd_config.teacher_model_by_agent_name.values())
-    )
-    if len(unique_teacher_checkpoints) != 1:
-        raise ValueError(
-            "on_policy_distillation.full currently supports exactly one unique "
-            f"teacher checkpoint, got {len(unique_teacher_checkpoints)}: "
-            f"{unique_teacher_checkpoints}. Multi-teacher full-vocabulary "
-            "distillation needs one LM head and one payload column per teacher."
-        )
+    # Multi-teacher support: each unique checkpoint gets its own teacher
+    # worker group, LM-head shard, and a stable per-sample teacher index
+    # (see opd.py's create_teacher_worker_groups / OPD_FULL_TEACHER_INDEX_FIELD)
+    # that routes each row's payload to the right shard at training time. No
+    # cardinality limit on unique_teacher_checkpoints here anymore.
 
     if (
         full_cfg.teacher_payload == "hidden_states"
