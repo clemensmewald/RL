@@ -2072,13 +2072,23 @@ class MegatronPolicyWorkerImpl(
         self.timer.stop("get_logprobs")
         return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
 
-    def _resolve_output_layer_owner(self) -> Any:
-        """Return the unwrapped module that owns ``output_layer`` on this rank.
+    def _resolve_output_layer_owner(self) -> Optional[Any]:
+        """Return the unwrapped module owning ``output_layer``, or None off the last PP stage.
+
+        Megatron builds ``output_layer`` only on the last pipeline stage, and
+        that is also the only stage where the opd_full loss runs, so the earlier
+        stages legitimately have nothing to project with. They still take part
+        in the LM-head load collective; see
+        ``_load_opd_full_teacher_lm_head_from_path``.
+
+        Returns:
+            The module owning ``output_layer``, or ``None`` when this rank is
+            not the last pipeline stage.
 
         Raises:
-            AttributeError: If this rank has no output layer. Megatron only builds
-                one on the last pipeline stage, so this is the expected failure
-                when opd_full runs with student pipeline parallelism.
+            AttributeError: If this rank *is* the last pipeline stage and still
+                has no output layer -- a malformed model rather than a
+                pipeline-placement consequence.
         """
         model = unwrap_model(self.model)
         if hasattr(model, "output_layer"):
@@ -2086,20 +2096,14 @@ class MegatronPolicyWorkerImpl(
         language_model = getattr(model, "language_model", None)
         if language_model is not None and hasattr(language_model, "output_layer"):
             return language_model
-        pipeline_size = (
-            parallel_state.get_pipeline_model_parallel_world_size()
-            if torch.distributed.is_initialized()
-            else 1
-        )
+        if (
+            torch.distributed.is_initialized()
+            and not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+        ):
+            return None
         raise AttributeError(
-            "opd_full requires an output_layer on this rank, but none was found "
-            f"after unwrapping {type(model).__qualname__}. Megatron builds "
-            "output_layer only on the last pipeline stage "
-            f"(pipeline_model_parallel_size={pipeline_size}); the teacher LM head "
-            "cannot be loaded per-stage because resolving its checkpoint iteration "
-            "(Megatron-Bridge read_train_state) broadcasts over the whole world. "
-            "Use pipeline_model_parallel_size=1 or "
-            "on_policy_distillation.full.teacher_payload='logits'."
+            "opd_full requires an output_layer on the last pipeline stage, but "
+            f"none was found after unwrapping {type(model).__qualname__}."
         )
 
     def load_opd_full_teacher_lm_head(
@@ -2132,19 +2136,38 @@ class MegatronPolicyWorkerImpl(
     def _load_opd_full_teacher_lm_head_from_path(
         self, teacher_pretrained_path: str, teacher_index: int
     ) -> None:
-        """Load this rank's shard of one teacher's LM head from an already-resolved path."""
+        """Load this rank's shard of one teacher's LM head from an already-resolved path.
+
+        Under student pipeline parallelism only the last stage owns an
+        ``output_layer``, and only there does the opd_full loss run. The earlier
+        stages request no shard, but must still enter the load because
+        ``dist_checkpointing.load`` is a whole-world collective -- skipping it
+        would hang the last stage. They record the checkpoint path all the same,
+        so the ``evict`` lifecycle re-enters the collective in lockstep with the
+        stage that actually reloads a shard.
+        """
+        self._opd_full_teacher_checkpoint_paths[teacher_index] = teacher_pretrained_path
+
         owner = self._resolve_output_layer_owner()
+        if owner is None:
+            load_teacher_output_layer_weight(
+                teacher_pretrained_path=teacher_pretrained_path,
+                local_vocab_size=None,
+                dtype=None,
+            )
+            return
+
         output_layer = owner.output_layer
         output_weight = output_layer.weight
         if output_weight is None:
             output_weight = owner.shared_embedding_or_output_weight()
 
-        self._opd_full_teacher_checkpoint_paths[teacher_index] = teacher_pretrained_path
         teacher_lm_head = load_teacher_output_layer_weight(
             teacher_pretrained_path=teacher_pretrained_path,
             local_vocab_size=output_layer.output_size_per_partition,
             dtype=output_weight.dtype,
         )
+        assert teacher_lm_head is not None  # requested a shard, so one comes back
         self._opd_full_teacher_lm_heads[teacher_index] = teacher_lm_head
         if self._opd_full_lm_head_lifecycle == "none":
             self._move_opd_full_teacher_lm_head("cuda")

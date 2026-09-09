@@ -907,20 +907,15 @@ def _validate_opd_full_config(
     # that routes each row's payload to the right shard at training time. No
     # cardinality limit on unique_teacher_checkpoints here anymore.
 
-    if (
-        full_cfg.teacher_payload == "hidden_states"
-        and megatron_cfg["pipeline_model_parallel_size"] > 1
-    ):
-        raise ValueError(
-            "on_policy_distillation.full.teacher_payload='hidden_states' does not "
-            "support policy.megatron_cfg.pipeline_model_parallel_size > 1 yet. "
-            "Megatron builds output_layer only on the last pipeline stage, but resolving "
-            "the teacher checkpoint iteration goes through Megatron-Bridge's "
-            "read_train_state, whose broadcast_object_list spans the whole student "
-            "world, so earlier stages would fail while the last stage hangs in that "
-            "broadcast. Use pipeline_model_parallel_size=1, or "
-            "teacher_payload='logits', which needs no teacher LM head."
-        )
+    # Student pipeline parallelism needs no guard here. Megatron builds
+    # output_layer -- and runs the loss -- only on the last pipeline stage, so
+    # that is the only stage that projects the teacher's hidden states. Both
+    # whole-world collectives behind the LM-head load stay balanced anyway:
+    # every stage resolves the teacher checkpoint together (Megatron-Bridge's
+    # read_train_state), and the earlier stages then enter
+    # dist_checkpointing.load with an empty sharded state dict rather than a
+    # shard request. See megatron_policy_worker's
+    # _load_opd_full_teacher_lm_head_from_path.
 
     generation_config = policy_config.get("generation")
     temperature = 1.0 if generation_config is None else generation_config["temperature"]

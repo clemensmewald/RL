@@ -2290,27 +2290,30 @@ class TestOPDFullValidation:
         with pytest.raises(ValueError, match="fuse_loss"):
             _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_rejects_more_than_one_teacher_checkpoint(self):
-        """One LM head and one payload column exist; a second teacher needs both."""
+    def test_allows_more_than_one_teacher_checkpoint(self):
+        """Each unique checkpoint gets its own LM-head shard and teacher index.
+
+        Rows carry ``OPD_FULL_TEACHER_INDEX_FIELD`` so the student projects each
+        one through its own teacher's shard, so there is no cardinality limit.
+        """
         config = _load_fullvocab_master_config()
         config.on_policy_distillation.teacher_model_by_agent_name = {
             "a": "/ckpt/teacher-a",
             "b": "/ckpt/teacher-b",
         }
-        with pytest.raises(ValueError, match="exactly one unique"):
-            _validate_opd_full_config(config, config.on_policy_distillation)
+        _validate_opd_full_config(config, config.on_policy_distillation)
 
-    def test_rejects_pipeline_parallel_on_the_hidden_state_path(self):
-        """Megatron builds output_layer only on the last pipeline stage.
+    def test_allows_pipeline_parallel_on_the_hidden_state_path(self):
+        """Only the last pipeline stage owns an output_layer -- and runs the loss.
 
-        Resolving the teacher checkpoint iteration goes through Megatron-Bridge's
-        read_train_state, whose broadcast spans the whole student world, so
-        earlier stages would raise while the last stage hangs inside it.
+        Both whole-world collectives stay balanced anyway: every stage resolves
+        the teacher checkpoint together (Megatron-Bridge's ``read_train_state``),
+        and the earlier stages then enter ``dist_checkpointing.load`` with an
+        empty sharded state dict instead of a shard request.
         """
         config = _load_fullvocab_master_config()
         config.policy["megatron_cfg"]["pipeline_model_parallel_size"] = 2
-        with pytest.raises(ValueError, match="pipeline_model_parallel_size > 1"):
-            _validate_opd_full_config(config, config.on_policy_distillation)
+        _validate_opd_full_config(config, config.on_policy_distillation)
 
     def test_rejects_a_sampling_temperature_on_the_hidden_state_path(self):
         """Temperature divides the training logits after the capture hook reads them.
