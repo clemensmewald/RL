@@ -547,6 +547,18 @@ class AsyncTrajectoryCollector:
                     if not self.running:
                         break
 
+                # Defer new batch workers while collection is manually paused
+                # (for example, during validation). A thread parked in the
+                # generation-limit or refit waits above wakes below the loop-top
+                # pause check and would otherwise spawn a worker despite the pause.
+                # In-flight workers finish naturally.
+                if not self._manual_pause_cleared.is_set() and self.running:
+                    with (
+                        efficiency_span("idle/validation_pause", tracer=self._tracer),
+                        self._efficiency_timer.time("idle/validation_pause"),
+                    ):
+                        self._manual_pause_cleared.wait()
+
                 if not self.running:
                     break
 
