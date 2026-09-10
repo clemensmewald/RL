@@ -9,9 +9,7 @@ For more examples and setup details, continue to the [Prerequisites](installatio
 
 ## Quick Start Options
 
-| Native PyTorch (DTensor) | Megatron Core |
-|--------------------------|---------------|
-| **Clone and create the environment** | |
+### Clone and create the environment
 
 ```sh
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl
@@ -21,22 +19,31 @@ uv venv
 ```
 
 > [!NOTE]
-> If you previously ran without checking out the submodules, you may need to rebuild virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true`. See [Tips and Tricks](tips-and-tricks.md).
+> If you previously ran without checking out the submodules, you may need to
+> rebuild virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true`.
+> See [Tips and Tricks](tips-and-tricks.md).
 
-| Native PyTorch (DTensor) | Megatron Core |
-|--------------------------|---------------|
-| **Run GRPO (DTensor)** | **Run GRPO (Megatron)** |
+::::{tab-set}
+
+:::{tab-item} Native PyTorch (DTensor)
+:selected:
 
 ```sh
-# DTensor
 uv run python examples/run_grpo.py
 ```
 
+:::
+
+:::{tab-item} Megatron Core
+
 ```sh
-# Megatron
 uv run examples/run_grpo.py \
   --config examples/configs/grpo_math_1B_megatron.yaml
 ```
+
+:::
+
+::::
 
 ### Smoke Test
 
